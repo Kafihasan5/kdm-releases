@@ -1,0 +1,170 @@
+name: Release
+
+# Builds a tag of the private source and publishes it here. Run: gh workflow run release.yml -f tag=v0.2.3
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The source's tag
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Kafihasan5/kdm
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_KEY }}
+
+      # dtolnay/rust-toolchain has no version tags; this is the head of its `stable` branch.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # The tag names the version users see; a mismatch would ship one version labelled as another.
+      - name: Check the tag matches the app version
+        if: github.event_name == 'push'
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 --locked | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object name -EQ 'quantumdm').version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match app version $version (Cargo.toml)."
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the extension
+        working-directory: extension
+        run: |
+          npm ci
+          npm run build
+
+      - name: Fetch yt-dlp and ffmpeg
+        shell: pwsh
+        run: ./packaging/release/fetch-tools.ps1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Installing Inno Setup failed.' }
+          }
+
+      # Optional: with the WINDOWS_CERT_PFX_BASE64 secret (and WINDOWS_CERT_PASSWORD) the exe,
+      # setup and uninstaller are signed; without it the build is unsigned.
+      - name: Load the signing certificate
+        shell: pwsh
+        env:
+          CERT_PFX_BASE64: ${{ secrets.WINDOWS_CERT_PFX_BASE64 }}
+        run: |
+          if ($env:CERT_PFX_BASE64) {
+            $pfx = Join-Path $env:RUNNER_TEMP 'quantumdm-sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT_PFX_BASE64))
+            "QUANTUMDM_SIGN_CERT=$pfx" >> $env:GITHUB_ENV
+          }
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          QUANTUMDM_SIGN_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+        run: ./packaging/windows/build.ps1
+
+      - name: Remove the certificate
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $env:RUNNER_TEMP 'quantumdm-sign.pfx')
+
+      - name: Name the installer
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem target/installer/QuantumDM-Setup-*.exe | Select-Object -First 1
+          Move-Item $setup.FullName target/installer/QuantumDM-Setup-x64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/installer/QuantumDM-Setup-x64.exe
+          if-no-files-found: error
+
+  mac:
+    name: Mac ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-14 }
+          - { arch: intel, runner: macos-15-intel }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Kafihasan5/kdm
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_KEY }}
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the extension's build tools
+        working-directory: extension
+        run: npm ci
+
+      - name: Fetch yt-dlp and ffmpeg
+        run: ./packaging/release/fetch-tools.sh ${{ matrix.arch }}
+
+      - name: Build
+        run: ./packaging/macos/build.sh --release ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.arch }}
+          path: |
+            target/macos/QuantumDM-mac-${{ matrix.arch }}.dmg
+            target/macos/QuantumDM-mac-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: built
+          merge-multiple: true
+
+      - name: Publish
+        working-directory: built
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          hash() { sha256sum "$1" | cut -d' ' -f1; }
+          cat > latest.json <<JSON
+          {"version":"${TAG#v}","assets":{
+          "mac-arm64":{"name":"QuantumDM-mac-arm64.zip","sha256":"$(hash QuantumDM-mac-arm64.zip)"},
+          "mac-intel":{"name":"QuantumDM-mac-intel.zip","sha256":"$(hash QuantumDM-mac-intel.zip)"},
+          "windows":{"name":"QuantumDM-Setup-x64.exe","sha256":"$(hash QuantumDM-Setup-x64.exe)"}}}
+          JSON
+          gh release create "$TAG" ./* -R "$GITHUB_REPOSITORY" --title "$TAG" --notes "Quantum Download Manager ${TAG#v}"
